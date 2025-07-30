@@ -41,8 +41,10 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/policy/compute"
 	proxyendpoint "github.com/cilium/cilium/pkg/proxy/endpoint"
 	"github.com/cilium/cilium/pkg/testutils"
+	testcompute "github.com/cilium/cilium/pkg/testutils/compute"
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
 	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
 	testpolicy "github.com/cilium/cilium/pkg/testutils/policy"
@@ -53,6 +55,7 @@ import (
 type EndpointSuite struct {
 	orchestrator endpoint.Orchestrator
 	repo         policy.PolicyRepository
+	fetcher      compute.PolicyRecomputer
 	mgr          *cache.CachingIdentityAllocator
 }
 
@@ -60,11 +63,14 @@ func setupEndpointSuite(tb testing.TB) *EndpointSuite {
 	testutils.IntegrationTest(tb)
 	logger := hivetest.Logger(tb)
 
+	idmgr := identitymanager.NewIDManager(logger)
+	repo := policy.NewPolicyRepository(logger, nil, nil, nil, idmgr, testpolicy.NewPolicyMetricsNoop())
 	s := &EndpointSuite{
 		orchestrator: &fakeendpoint.FakeOrchestrator{},
-		repo:         policy.NewPolicyRepository(logger, nil, nil, nil, nil, testpolicy.NewPolicyMetricsNoop()),
+		repo:         repo,
 		mgr:          cache.NewCachingIdentityAllocator(logger, &testidentity.IdentityAllocatorOwnerMock{}, cache.NewTestAllocatorConfig()),
 	}
+	s.fetcher = testcompute.InstantiateCellForTesting(tb, logger, "endpoint", "setupEndpointSuite", repo, idmgr)
 
 	// GetConfig the default labels prefix filter
 	err := labelsfilter.ParseLabelPrefixCfg(logger, nil, nil, "")
@@ -86,6 +92,28 @@ func setupEndpointSuite(tb testing.TB) *EndpointSuite {
 	})
 
 	return s
+}
+
+func createEndpointParams(tb testing.TB, o endpoint.Orchestrator, r policy.PolicyRepository, fetcher compute.PolicyRecomputer) EndpointParams {
+	return EndpointParams{
+		Logger:           hivetest.Logger(tb),
+		EPBuildQueue:     &MockEndpointBuildQueue{},
+		Orchestrator:     o,
+		PolicyRepo:       r,
+		PolicyFetcher:    fetcher,
+		IdentityManager:  identitymanager.NewIDManager(hivetest.Logger(tb)),
+		NamedPortsGetter: testipcache.NewMockIPCache(),
+		IPSecConfig:      fakeipsec.Config{},
+		WgConfig:         fakewireguard.Config{},
+		CTMapGC:          ctmap.NewFakeGCRunner(),
+		Allocator:        testidentity.NewMockIdentityAllocator(nil),
+		LocalNodeStore:   node.NewTestLocalNodeStore(node.LocalNode{}),
+	}
+}
+
+func createTestEndpointParams(tb testing.TB) EndpointParams {
+	s := setupEndpointSuite(tb)
+	return createEndpointParams(tb, s.orchestrator, s.repo, s.fetcher)
 }
 
 func TestEndpointStatus(t *testing.T) {
@@ -189,36 +217,16 @@ func TestEndpointStatus(t *testing.T) {
 	require.Equal(t, "OK", eps.String())
 }
 
-func createEndpointParams(tb testing.TB, o endpoint.Orchestrator, r policy.PolicyRepository) EndpointParams {
-	return EndpointParams{
-		Logger:           hivetest.Logger(tb),
-		EPBuildQueue:     &MockEndpointBuildQueue{},
-		Orchestrator:     o,
-		PolicyRepo:       r,
-		IdentityManager:  identitymanager.NewIDManager(hivetest.Logger(tb)),
-		NamedPortsGetter: testipcache.NewMockIPCache(),
-		IPSecConfig:      fakeipsec.Config{},
-		WgConfig:         fakewireguard.Config{},
-		CTMapGC:          ctmap.NewFakeGCRunner(),
-		Allocator:        testidentity.NewMockIdentityAllocator(nil),
-		LocalNodeStore:   node.NewTestLocalNodeStore(node.LocalNode{}),
-	}
-}
-
-func createTestEndpointParams(tb testing.TB) EndpointParams {
-	s := setupEndpointSuite(tb)
-	return createEndpointParams(tb, s.orchestrator, s.repo)
-}
-
 func TestEndpointDatapathOptions(t *testing.T) {
-	m := &models.EndpointChangeRequest{
+	s := setupEndpointSuite(t)
+
+	p := createEndpointParams(t, s.orchestrator, s.repo, s.fetcher)
+	p.Allocator = s.mgr
+	e, err := NewEndpointFromChangeModel(p, nil, &FakeEndpointProxy{}, &models.EndpointChangeRequest{
 		DatapathConfiguration: &models.EndpointDatapathConfiguration{
 			DisableSipVerification: true,
 		},
-	}
-
-	p := createTestEndpointParams(t)
-	e, err := NewEndpointFromChangeModel(p, nil, nil, m, nil)
+	}, nil)
 	require.NoError(t, err)
 	require.Equal(t, option.OptionDisabled, e.Options.GetValue(option.SourceIPVerification))
 }
@@ -477,10 +485,11 @@ func TestApplySourceIPVerificationResetsToGlobalDefault(t *testing.T) {
 }
 
 func TestEndpointUpdateLabels(t *testing.T) {
-	model := newTestEndpointModel(100, StateWaitingForIdentity)
-	p := createTestEndpointParams(t)
+	s := setupEndpointSuite(t)
 
-	e, err := NewEndpointFromChangeModel(p, nil, nil, model, nil)
+	model := newTestEndpointModel(100, StateWaitingForIdentity)
+	p := createEndpointParams(t, s.orchestrator, s.repo, s.fetcher)
+	e, err := NewEndpointFromChangeModel(p, nil, &FakeEndpointProxy{}, model, nil)
 	require.NoError(t, err)
 
 	e.Start(uint16(model.ID))
@@ -523,9 +532,11 @@ func TestEndpointUpdateLabels(t *testing.T) {
 }
 
 func TestEndpointState(t *testing.T) {
+	s := setupEndpointSuite(t)
+
 	model := newTestEndpointModel(100, StateWaitingForIdentity)
-	p := createTestEndpointParams(t)
-	e, err := NewEndpointFromChangeModel(p, nil, nil, model, nil)
+	p := createEndpointParams(t, s.orchestrator, s.repo, s.fetcher)
+	e, err := NewEndpointFromChangeModel(p, nil, &FakeEndpointProxy{}, model, nil)
 	require.NoError(t, err)
 	e.Start(uint16(model.ID))
 	t.Cleanup(e.Stop)
@@ -918,6 +929,8 @@ func (n *EndpointDeadlockEvent) Handle(ifc chan any) {
 // This unit test is a bit weird - see
 // https://github.com/cilium/cilium/pull/8687 .
 func TestEndpointEventQueueDeadlockUponStop(t *testing.T) {
+	s := setupEndpointSuite(t)
+
 	// Need to modify global configuration (hooray!), change back when test is
 	// done.
 	oldQueueSize := option.Config.EndpointQueueSize
@@ -927,8 +940,8 @@ func TestEndpointEventQueueDeadlockUponStop(t *testing.T) {
 	}()
 
 	model := newTestEndpointModel(12345, StateReady)
-	p := createTestEndpointParams(t)
-	ep, err := NewEndpointFromChangeModel(p, nil, nil, model, nil)
+	p := createEndpointParams(t, s.orchestrator, s.repo, s.fetcher)
+	ep, err := NewEndpointFromChangeModel(p, nil, &FakeEndpointProxy{}, model, nil)
 	require.NoError(t, err)
 
 	ep.Start(uint16(model.ID))
@@ -1006,9 +1019,11 @@ func TestEndpointEventQueueDeadlockUponStop(t *testing.T) {
 }
 
 func BenchmarkEndpointGetModel(b *testing.B) {
+	s := setupEndpointSuite(b)
+
 	model := newTestEndpointModel(100, StateWaitingForIdentity)
-	p := createTestEndpointParams(b)
-	e, err := NewEndpointFromChangeModel(p, nil, nil, model, nil)
+	p := createEndpointParams(b, s.orchestrator, s.repo, s.fetcher)
+	e, err := NewEndpointFromChangeModel(p, nil, &FakeEndpointProxy{}, model, nil)
 	require.NoError(b, err)
 
 	e.Start(uint16(model.ID))
@@ -1049,7 +1064,7 @@ func (e *Endpoint) getK8sPodLabels() labels.Labels {
 }
 
 func TestMetadataResolver(t *testing.T) {
-	p := createTestEndpointParams(t)
+	s := setupEndpointSuite(t)
 	logger := hivetest.Logger(t)
 
 	tests := []struct {
@@ -1087,8 +1102,9 @@ func TestMetadataResolver(t *testing.T) {
 			t.Run(fmt.Sprintf("%s (restored=%t)", tt.name, restored), func(t *testing.T) {
 				model := newTestEndpointModel(100, StateWaitingForIdentity)
 				kvstoreSync := ipcache.NewIPIdentitySynchronizer(logger, kvstore.SetupDummy(t, kvstore.DisabledBackendName))
+				p := createEndpointParams(t, s.orchestrator, s.repo, s.fetcher)
 				p.KVStoreSynchronizer = kvstoreSync
-				ep, err := NewEndpointFromChangeModel(p, nil, nil, model, nil)
+				ep, err := NewEndpointFromChangeModel(p, nil, &FakeEndpointProxy{}, model, nil)
 				require.NoError(t, err)
 
 				ep.K8sNamespace, ep.K8sPodName, ep.K8sUID = "bar", "foo", "uid"
@@ -1126,8 +1142,6 @@ func (p *recordingRemoveNetworkPolicyProxy) RemoveNetworkPolicy(ep proxyendpoint
 	p.calls++
 	p.lastEndpointID = ep.GetID()
 }
-
-//TODODODODO
 
 func (g fakeNodeGetter) Get(ctx context.Context) (node.LocalNode, error) {
 	return node.LocalNode{}, nil

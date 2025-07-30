@@ -30,8 +30,10 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/policy/compute"
 	proxyendpoint "github.com/cilium/cilium/pkg/proxy/endpoint"
 	"github.com/cilium/cilium/pkg/revert"
+	testcompute "github.com/cilium/cilium/pkg/testutils/compute"
 	testidentity "github.com/cilium/cilium/pkg/testutils/identity"
 	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
 	testpolicy "github.com/cilium/cilium/pkg/testutils/policy"
@@ -193,7 +195,7 @@ func (p *recordingEndpointProxy) IsSDPEnabled() bool {
 	return false
 }
 
-func newUpdatePolicyMapsTestRepo(t *testing.T) (*policy.Repository, identitymanager.IDManager) {
+func newUpdatePolicyMapsTestRepo(t *testing.T) (*policy.Repository, identitymanager.IDManager, compute.PolicyRecomputer) {
 	t.Helper()
 
 	logger := hivetest.Logger(t)
@@ -206,6 +208,7 @@ func newUpdatePolicyMapsTestRepo(t *testing.T) (*policy.Repository, identitymana
 		idmgr,
 		testpolicy.NewPolicyMetricsNoop(),
 	)
+	fetcher := testcompute.InstantiateCellForTesting(t, logger, "endpointmanager", t.Name(), repo, idmgr)
 
 	oldPolicyMode := policy.GetPolicyEnabled()
 	policy.SetPolicyEnabled(option.DefaultEnforcement)
@@ -231,10 +234,10 @@ func newUpdatePolicyMapsTestRepo(t *testing.T) (*policy.Repository, identitymana
 		}},
 	}})
 
-	return repo, idmgr
+	return repo, idmgr, fetcher
 }
 
-func newUpdatePolicyMapsTestEndpoint(t *testing.T, mgr *endpointManager, repo policy.PolicyRepository, idmgr identitymanager.IDManager, proxy endpoint.EndpointProxy, modelID int, addr netip.Addr) *endpoint.Endpoint {
+func newUpdatePolicyMapsTestEndpoint(t *testing.T, mgr *endpointManager, repo policy.PolicyRepository, idmgr identitymanager.IDManager, fetcher compute.PolicyRecomputer, proxy endpoint.EndpointProxy, modelID int, addr netip.Addr) *endpoint.Endpoint {
 	t.Helper()
 
 	model := newTestEndpointModel(modelID, endpoint.StateWaitingForIdentity)
@@ -243,6 +246,7 @@ func newUpdatePolicyMapsTestEndpoint(t *testing.T, mgr *endpointManager, repo po
 		EPBuildQueue:     &endpoint.MockEndpointBuildQueue{},
 		Orchestrator:     &fakeendpoint.FakeOrchestrator{},
 		PolicyRepo:       repo,
+		PolicyFetcher:    fetcher,
 		IdentityManager:  idmgr,
 		NamedPortsGetter: testipcache.NewMockIPCache(),
 		IPSecConfig:      fakeipsec.Config{},
@@ -277,11 +281,11 @@ func newUpdatePolicyMapsTestEndpoint(t *testing.T, mgr *endpointManager, repo po
 func TestUpdatePolicyMapsFinalizesDeferredNetworkPolicyCallbacksAfterSuccessfulWait(t *testing.T) {
 	logger := hivetest.Logger(t)
 	mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
-	repo, idmgr := newUpdatePolicyMapsTestRepo(t)
+	repo, idmgr, fetcher := newUpdatePolicyMapsTestRepo(t)
 	proxy := newRecordingEndpointProxy()
 
-	ep1 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, proxy, 101, netip.MustParseAddr("10.0.0.1"))
-	ep2 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, proxy, 102, netip.MustParseAddr("10.0.0.2"))
+	ep1 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, fetcher, proxy, 101, netip.MustParseAddr("10.0.0.1"))
+	ep2 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, fetcher, proxy, 102, netip.MustParseAddr("10.0.0.2"))
 
 	proxy.expectUpdates(2)
 
@@ -308,11 +312,11 @@ func TestUpdatePolicyMapsFinalizesDeferredNetworkPolicyCallbacksAfterSuccessfulW
 func TestUpdatePolicyMapsRevertsDeferredNetworkPolicyCallbacksAfterProxyWaitFailure(t *testing.T) {
 	logger := hivetest.Logger(t)
 	mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
-	repo, idmgr := newUpdatePolicyMapsTestRepo(t)
+	repo, idmgr, fetcher := newUpdatePolicyMapsTestRepo(t)
 	proxy := newRecordingEndpointProxy()
 
-	ep1 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, proxy, 201, netip.MustParseAddr("10.0.1.1"))
-	ep2 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, proxy, 202, netip.MustParseAddr("10.0.1.2"))
+	ep1 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, fetcher, proxy, 201, netip.MustParseAddr("10.0.1.1"))
+	ep2 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, fetcher, proxy, 202, netip.MustParseAddr("10.0.1.2"))
 
 	proxy.expectUpdates(2)
 
@@ -340,11 +344,11 @@ func TestUpdatePolicyMapsRevertsDeferredNetworkPolicyCallbacksAfterProxyWaitFail
 func TestUpdatePolicyMapsDoesNotDeferCallbacksForSynchronousApplyFailure(t *testing.T) {
 	logger := hivetest.Logger(t)
 	mgr := New(logger, nil, &dummyEpSyncher{}, nil, nil, nil, defaultEndpointManagerConfig)
-	repo, idmgr := newUpdatePolicyMapsTestRepo(t)
+	repo, idmgr, fetcher := newUpdatePolicyMapsTestRepo(t)
 	proxy := newRecordingEndpointProxy()
 
-	ep1 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, proxy, 301, netip.MustParseAddr("10.0.2.1"))
-	ep2 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, proxy, 302, netip.MustParseAddr("10.0.2.2"))
+	ep1 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, fetcher, proxy, 301, netip.MustParseAddr("10.0.2.1"))
+	ep2 := newUpdatePolicyMapsTestEndpoint(t, mgr, repo, idmgr, fetcher, proxy, 302, netip.MustParseAddr("10.0.2.2"))
 
 	proxy.expectUpdates(2)
 	proxy.setSynchronousError(ep1.GetID(), errors.New("sync proxy error"))
