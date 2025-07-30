@@ -46,6 +46,7 @@ import (
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	policycell "github.com/cilium/cilium/pkg/policy/cell"
+	"github.com/cilium/cilium/pkg/policy/compute"
 	"github.com/cilium/cilium/pkg/policy/types"
 	"github.com/cilium/cilium/pkg/promise"
 	testcertificatemanager "github.com/cilium/cilium/pkg/testutils/certificatemanager"
@@ -62,6 +63,7 @@ type testFixture struct {
 	allocator  cache.IdentityAllocator
 	epm        endpointmanager.EndpointManager
 	repo       policy.PolicyRepository
+	computer   compute.PolicyRecomputer
 	importer   policycell.PolicyImporter
 	templateEP *endpoint.Endpoint
 }
@@ -89,11 +91,12 @@ func newTestFixture(t testing.TB, log *slog.Logger, certMgr certificatemanager.C
 
 		cell.Invoke(
 			func(client_ *k8sClient.FakeClientset, repo_ policy.PolicyRepository, idmgr_ identitymanager.IDManager,
-				alloc_ cache.IdentityAllocator,
+				alloc_ cache.IdentityAllocator, comp_ compute.PolicyRecomputer,
 				imp_ policycell.PolicyImporter, epm_ endpointmanager.EndpointManager) error {
 				f.repo = repo_
 				f.idmgr = idmgr_
 				f.allocator = alloc_
+				f.computer = comp_
 				f.importer = imp_
 				f.epm = epm_
 
@@ -116,6 +119,7 @@ func newTestFixture(t testing.TB, log *slog.Logger, certMgr certificatemanager.C
 						MonitorAgent:        &testmonitor.TestMonitorAgent{},
 						PolicyMapFactory:    &fakePolicyMapFactory{},
 						PolicyRepo:          f.repo,
+						PolicyFetcher:       f.computer,
 						NamedPortsGetter:    testipcache.NewMockIPCache(),
 						Allocator:           f.allocator,
 						CTMapGC:             ctmap.NewFakeGCRunner(),
@@ -163,6 +167,11 @@ func newTestFixture(t testing.TB, log *slog.Logger, certMgr certificatemanager.C
 		policycell.Cell,
 		endpointmanager.TestCell,
 		node.LocalNodeStoreTestCell,
+
+		cell.Provide(func(params compute.Params) compute.PolicyRecomputer {
+			return compute.NewIdentityPolicyComputer(params)
+		}),
+		cell.ProvidePrivate(compute.NewPolicyComputationTable),
 	)
 
 	require.NoError(t, f.hive.Start(log, context.Background()))
