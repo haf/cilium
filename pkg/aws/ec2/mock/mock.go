@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	ec2_types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -657,10 +658,10 @@ func (e *API) GetInstance(ctx context.Context, vpcs ipamTypes.VirtualNetworkMap,
 
 			if vpcs != nil {
 				if vpc, ok := vpcs[eni.VPC.ID]; ok {
-					if p, err := netip.ParsePrefix(vpc.PrimaryCIDR); err == nil {
-						eni.VPC.PrimaryCIDR = iputil.PrefixFrom(p)
+					if vpc.PrimaryCIDR.IsValid() {
+						eni.VPC.PrimaryCIDR = vpc.PrimaryCIDR
 					}
-					eni.VPC.CIDRs = cslices.Map(vpc.CIDRs, parsePrefix)
+					eni.VPC.CIDRs = slices.Clone(vpc.CIDRs)
 				}
 			}
 
@@ -714,10 +715,10 @@ func (e *API) GetInstances(ctx context.Context, vpcs ipamTypes.VirtualNetworkMap
 
 			if vpcs != nil {
 				if vpc, ok := vpcs[eni.VPC.ID]; ok {
-					if p, err := netip.ParsePrefix(vpc.PrimaryCIDR); err == nil {
-						eni.VPC.PrimaryCIDR = iputil.PrefixFrom(p)
+					if vpc.PrimaryCIDR.IsValid() {
+						eni.VPC.PrimaryCIDR = vpc.PrimaryCIDR
 					}
-					eni.VPC.CIDRs = cslices.Map(vpc.CIDRs, parsePrefix)
+					eni.VPC.CIDRs = slices.Clone(vpc.CIDRs)
 				}
 			}
 
@@ -806,9 +807,3 @@ func (e *API) GetInstanceTypes(ctx context.Context) ([]ec2_types.InstanceTypeInf
 	return e.instanceTypes, nil
 }
 
-// parsePrefix parses a CIDR string into an iputil.Prefix, returning a zero
-// value on parse error.
-func parsePrefix(s string) iputil.Prefix {
-	p, _ := netip.ParsePrefix(s)
-	return iputil.PrefixFrom(p)
-}
