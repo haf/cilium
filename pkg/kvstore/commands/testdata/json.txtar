@@ -1,0 +1,58 @@
+# Test writing a JSON value and reading it back
+kvstore/update -i json cilium/cluster-config/cluster-a cluster-config.json
+kvstore/list -o json cilium/cluster-config cluster-config.actual
+cmp cluster-config.actual cluster-config.expected
+kvstore/list cilium/cluster-config cluster-config.actual
+cmp cluster-config.actual cluster-config.expected
+
+# Test writing a blob value to unknown key
+kvstore/update unknown/key plain.txt
+kvstore/list unknown unknown.actual
+cmp unknown.actual unknown.expected
+kvstore/list -o plain unknown unknown.actual
+cmp unknown.actual unknown.expected
+
+# Test error handling arround JSON input/output and unknwonw key
+kvstore/list -o json unknown unknown-json-read.actual
+cmp unknown-json-read.actual unknown-json-read.expected
+! kvstore/update -i json unknown/key value.json
+
+# The value should not have been updated
+kvstore/list unknown unknown.actual
+cmp unknown.actual unknown.expected
+
+kvstore/update cilium/synced/cluster-a plain.txt
+
+# Test error handling arround JSON input/output and blob key
+! kvstore/update -i json cilium/synced/cluster-a cluster-config.json
+kvstore/list -o json cilium/synced/cluster-a blob-json-read.actual
+cmp blob-json-read.actual blob-json-read.expected
+
+# The value should not have been updated
+kvstore/list cilium/synced/cluster-a blob.actual
+cmp blob.actual blob.expected
+
+-- cluster-config.json --
+{"id":1,"capabilities":{"cached":true}}
+-- cluster-config.expected --
+# cilium/cluster-config/cluster-a
+{
+  "id": 1,
+  "capabilities": {
+    "cached": true
+  }
+}
+-- unknown.expected --
+# unknown/key
+Hello World!
+-- plain.txt --
+Hello World!
+-- unknown-json-read.expected --
+# unknown/key
+ERROR: cannot handle JSON output for key "unknown/key" of type "unknown"
+-- blob-json-read.expected --
+# cilium/synced/cluster-a
+ERROR: cannot handle JSON output for key "cilium/synced/cluster-a" of type "blob"
+-- blob.expected --
+# cilium/synced/cluster-a
+Hello World!
